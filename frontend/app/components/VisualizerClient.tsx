@@ -8,24 +8,31 @@ import { InspectorPanel } from './InspectorPanel';
 import { TimelineScrubber } from './TimelineScrubber';
 import { EpisodeBrowserModal } from './EpisodeBrowserModal';
 import { KeyboardShortcutsModal } from './KeyboardShortcutsModal';
+import { SaveSettingsModal } from './SaveSettingsModal';
 
 import { Episode, RunSummary } from '../lib/types';
 import { parsePredicates, inferAction } from '../lib/predicateParser';
 import { computeLayout, extractTrajectoryTableBases } from '../lib/layoutEngine';
 import { calculatePredicateDiff } from '../lib/predicateDiff';
 import { DEFAULT_TUTORIAL_EPISODES } from '../lib/constants';
-import { AlertTriangle, CheckCircle2, Loader2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Loader2, Boxes, Upload } from 'lucide-react';
+
+const LAST_RUN_STORAGE_KEY = 'blocksworld_selected_run_id';
+const DEFAULT_RUN_STORAGE_KEY = 'blocksworld_default_run_id';
 
 export default function VisualizerClient() {
   // Available runs from server API
   const [availableRuns, setAvailableRuns] = useState<RunSummary[]>([]);
-  const [selectedRunId, setSelectedRunId] = useState<string>('train_0.json');
+  const [selectedRunId, setSelectedRunId] = useState<string>('');
   const [totalEpisodesInRun, setTotalEpisodesInRun] = useState<number>(0);
+  const [defaultRunId, setDefaultRunIdState] = useState<string | null>(null);
 
-  // Active Episode State
-  const [currentEpisode, setCurrentEpisode] = useState<Episode>(
-    DEFAULT_TUTORIAL_EPISODES[0]
-  );
+  // Save Settings Modal State
+  const [manageModalRun, setManageModalRun] = useState<RunSummary | null>(null);
+  const [isManageModalOpen, setIsManageModalOpen] = useState<boolean>(false);
+
+  // Active Episode State (null when no run selected)
+  const [currentEpisode, setCurrentEpisode] = useState<Episode | null>(null);
   const [currentStep, setCurrentStep] = useState<number>(0);
   const [uploadedEpisodes, setUploadedEpisodes] = useState<Episode[]>([]);
   const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
@@ -82,45 +89,174 @@ export default function VisualizerClient() {
     }
   }, []);
 
-  // 2. Fetch available runs on initial mount
+  // 2. Fetch available runs on initial mount (remembering user's last choice)
   useEffect(() => {
     const fetchRuns = async () => {
       try {
         const res = await fetch('/api/runs');
         if (res.ok) {
           const data = await res.json();
-          if (data.runs && data.runs.length > 0) {
-            setAvailableRuns(data.runs);
-            // Prefer the main training run (train_0.json) or any run with >= 8657 episodes
-            const defaultRun =
-              data.runs.find((r: any) => r.id === 'train_0.json' || r.id === 'train_0') ||
-              data.runs.find((r: any) => r.totalEpisodes >= 8657) ||
-              data.runs[0];
+          const runs: RunSummary[] = data.runs || [];
+          setAvailableRuns(runs);
 
-            setSelectedRunId(defaultRun.id);
-            setTotalEpisodesInRun(defaultRun.totalEpisodes);
+          // Get defaultRunId from server or localStorage
+          const serverDefault = data.defaultRunId || null;
+          const localDefault =
+            typeof window !== 'undefined'
+              ? localStorage.getItem(DEFAULT_RUN_STORAGE_KEY)
+              : null;
+          const effectiveDefault = serverDefault || localDefault || null;
+          setDefaultRunIdState(effectiveDefault);
 
-            // Default epoch 8657 (1-based: Epoch #8657 corresponds to index 8656)
-            const defaultEpochIndex = defaultRun.totalEpisodes >= 8657 ? 8656 : 0;
-            loadServerEpisode(defaultRun.id, defaultEpochIndex);
-            return;
+          // Restore user's last choice from localStorage if available
+          const savedRunId =
+            typeof window !== 'undefined'
+              ? localStorage.getItem(LAST_RUN_STORAGE_KEY)
+              : null;
+
+          if (savedRunId) {
+            if (savedRunId === 'tutorial') {
+              setSelectedRunId('tutorial');
+              setCurrentEpisode(DEFAULT_TUTORIAL_EPISODES[0]);
+              return;
+            }
+
+            const matchingRun = runs.find((r) => r.id === savedRunId);
+            if (matchingRun) {
+              setSelectedRunId(matchingRun.id);
+              setTotalEpisodesInRun(matchingRun.totalEpisodes);
+              const defaultEpochIndex = matchingRun.totalEpisodes > 0 ? matchingRun.totalEpisodes - 1 : 0;
+              loadServerEpisode(matchingRun.id, defaultEpochIndex);
+              return;
+            } else {
+              // Run no longer exists in data/runs
+              localStorage.removeItem(LAST_RUN_STORAGE_KEY);
+            }
           }
+
+          // If no previous choice, check if there is an active default save configured
+          if (effectiveDefault) {
+            const defaultMatching = runs.find(
+              (r) => r.id === effectiveDefault || r.id === `${effectiveDefault}.json`
+            );
+            if (defaultMatching) {
+              setSelectedRunId(defaultMatching.id);
+              setTotalEpisodesInRun(defaultMatching.totalEpisodes);
+              const defaultEpochIndex =
+                defaultMatching.totalEpisodes > 0 ? defaultMatching.totalEpisodes - 1 : 0;
+              loadServerEpisode(defaultMatching.id, defaultEpochIndex);
+              return;
+            }
+          }
+
+          // No default JSON selected by default
+          setSelectedRunId('');
+          setCurrentEpisode(null);
+          return;
         }
       } catch (err) {
         console.error('Failed to query runs API:', err);
       }
 
-      // Fallback to tutorial episode if no training run found
-      setSelectedRunId('tutorial');
-      setCurrentEpisode(DEFAULT_TUTORIAL_EPISODES[0]);
+      setSelectedRunId('');
+      setCurrentEpisode(null);
     };
 
     fetchRuns();
   }, [loadServerEpisode]);
 
-  // 3. Handle run selection change
+  // Refresh runs helper
+  const refreshRuns = useCallback(async () => {
+    try {
+      const res = await fetch('/api/runs');
+      if (res.ok) {
+        const data = await res.json();
+        const runs = data.runs || [];
+        setAvailableRuns(runs);
+        if (data.defaultRunId !== undefined) {
+          setDefaultRunIdState(data.defaultRunId);
+        }
+        return runs as RunSummary[];
+      }
+    } catch (err) {
+      console.error('Failed to refresh runs:', err);
+    }
+    return [];
+  }, []);
+
+  const handleRunRenamed = async (oldRunId: string, newRunId: string) => {
+    const updatedRuns = await refreshRuns();
+    if (selectedRunId === oldRunId) {
+      setSelectedRunId(newRunId);
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(LAST_RUN_STORAGE_KEY, newRunId);
+      }
+    }
+    if (defaultRunId === oldRunId) {
+      setDefaultRunIdState(newRunId);
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(DEFAULT_RUN_STORAGE_KEY, newRunId);
+      }
+    }
+    const matching = updatedRuns.find((r) => r.id === newRunId);
+    if (matching) {
+      setManageModalRun(matching);
+    }
+  };
+
+  const handleRunDeleted = async (deletedRunId: string) => {
+    const updatedRuns = await refreshRuns();
+    if (selectedRunId === deletedRunId) {
+      if (defaultRunId && defaultRunId !== deletedRunId) {
+        const defRun = updatedRuns.find((r) => r.id === defaultRunId);
+        if (defRun) {
+          handleSelectRun(defRun.id);
+          return;
+        }
+      }
+      setSelectedRunId('');
+      setCurrentEpisode(null);
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem(LAST_RUN_STORAGE_KEY);
+      }
+    }
+    if (defaultRunId === deletedRunId) {
+      setDefaultRunIdState(null);
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem(DEFAULT_RUN_STORAGE_KEY);
+      }
+    }
+    setIsManageModalOpen(false);
+  };
+
+  const handleSetDefault = async (newDefaultRunId: string | null) => {
+    setDefaultRunIdState(newDefaultRunId);
+    if (typeof window !== 'undefined') {
+      if (newDefaultRunId) {
+        localStorage.setItem(DEFAULT_RUN_STORAGE_KEY, newDefaultRunId);
+      } else {
+        localStorage.removeItem(DEFAULT_RUN_STORAGE_KEY);
+      }
+    }
+    await refreshRuns();
+  };
+
+  // 3. Handle run selection change (persisting choice in localStorage)
   const handleSelectRun = (runId: string) => {
     setSelectedRunId(runId);
+
+    if (!runId) {
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem(LAST_RUN_STORAGE_KEY);
+      }
+      setCurrentEpisode(null);
+      return;
+    }
+
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(LAST_RUN_STORAGE_KEY, runId);
+    }
+
     if (runId === 'tutorial') {
       setCurrentEpisode(DEFAULT_TUTORIAL_EPISODES[0]);
       setCurrentStep(0);
@@ -133,7 +269,7 @@ export default function VisualizerClient() {
       const run = availableRuns.find((r) => r.id === runId);
       if (run) {
         setTotalEpisodesInRun(run.totalEpisodes);
-        const targetEpIndex = run.totalEpisodes >= 8657 ? 8656 : 0;
+        const targetEpIndex = run.totalEpisodes > 0 ? run.totalEpisodes - 1 : 0;
         loadServerEpisode(runId, targetEpIndex);
       }
     }
@@ -170,12 +306,15 @@ export default function VisualizerClient() {
           }
         }
 
+        if (typeof window !== 'undefined') {
+          localStorage.setItem(LAST_RUN_STORAGE_KEY, data.runId);
+        }
         setSelectedRunId(data.runId);
         setUploadedFileName(file.name);
         setSuccessMessage(
           `Uploaded and saved "${file.name}" under frontend/data/runs/. Loaded ${data.totalEpisodes} episodes.`
         );
-        const targetIndex = (data.totalEpisodes && data.totalEpisodes >= 8657) ? 8656 : 0;
+        const targetIndex = (data.totalEpisodes && data.totalEpisodes > 0) ? data.totalEpisodes - 1 : 0;
         await loadServerEpisode(data.runId, targetIndex);
         setIsUploading(false);
         return;
@@ -247,7 +386,7 @@ export default function VisualizerClient() {
           setUploadedEpisodes(parsedEps);
           setUploadedFileName(file.name);
           setSelectedRunId('custom');
-          setCurrentEpisode(parsedEps[0]);
+          setCurrentEpisode(parsedEps[parsedEps.length - 1]);
           setCurrentStep(0);
           setIsPlaying(false);
           setSuccessMessage(`Loaded ${file.name} in memory.`);
@@ -268,18 +407,18 @@ export default function VisualizerClient() {
 
   // 5. Pre-scan table bases for column stability
   const allEpisodeTableBases = useMemo(() => {
-    return extractTrajectoryTableBases(currentEpisode.trajectory || []);
+    return extractTrajectoryTableBases(currentEpisode?.trajectory || []);
   }, [currentEpisode]);
 
   // 6. Current Step Data & Layout Computation
-  const totalSteps = currentEpisode.trajectory?.length || 1;
+  const totalSteps = currentEpisode?.trajectory?.length || 1;
   const currentPredicatesRaw = useMemo(() => {
-    return currentEpisode.trajectory?.[currentStep] || [];
-  }, [currentEpisode.trajectory, currentStep]);
+    return currentEpisode?.trajectory?.[currentStep] || [];
+  }, [currentEpisode?.trajectory, currentStep]);
 
   const prevPredicatesRaw = useMemo(() => {
-    return currentStep > 0 ? currentEpisode.trajectory?.[currentStep - 1] || null : null;
-  }, [currentEpisode.trajectory, currentStep]);
+    return currentStep > 0 ? currentEpisode?.trajectory?.[currentStep - 1] || null : null;
+  }, [currentEpisode?.trajectory, currentStep]);
 
   const currentParsed = useMemo(() => {
     return parsePredicates(currentPredicatesRaw);
@@ -311,7 +450,7 @@ export default function VisualizerClient() {
 
   // Step Action inference
   const currentAction = useMemo(() => {
-    if (currentEpisode.actions && currentEpisode.actions[currentStep]) {
+    if (currentEpisode?.actions && currentEpisode.actions[currentStep]) {
       const act = currentEpisode.actions[currentStep];
       let actType = 'step';
       if (act.toLowerCase().startsWith('pickup')) actType = 'pickup';
@@ -322,7 +461,7 @@ export default function VisualizerClient() {
       return { name: act, type: actType };
     }
     return inferAction(prevParsed, currentParsed);
-  }, [currentEpisode.actions, currentStep, prevParsed, currentParsed]);
+  }, [currentEpisode, currentStep, prevParsed, currentParsed]);
 
   // 7. Auto Playback Timer
   useEffect(() => {
@@ -349,21 +488,22 @@ export default function VisualizerClient() {
   }, [isPlaying, playbackSpeed, totalSteps, isLooping]);
 
   // Episode Index & Epoch Numbering (1-based: 1st episode = index 0, 10000th = index 9999)
-  const currentEpisodeIndex =
-    typeof currentEpisode.episode_id === 'number'
+  const currentEpisodeIndex = currentEpisode
+    ? typeof currentEpisode.episode_id === 'number'
       ? currentEpisode.episode_id
-      : parseInt(String(currentEpisode.episode_id), 10) || 0;
+      : parseInt(String(currentEpisode.episode_id), 10) || 0
+    : 0;
 
   const totalEpochs =
     selectedRunId === 'tutorial'
       ? 1
       : uploadedEpisodes.length > 0
       ? uploadedEpisodes.length
-      : totalEpisodesInRun || 10000;
+      : totalEpisodesInRun || (currentEpisode ? 1 : 0);
 
   const currentEpochNumber = currentEpisodeIndex + 1;
-  const canPrevEpoch = currentEpisodeIndex > 0;
-  const canNextEpoch = currentEpisodeIndex < totalEpochs - 1;
+  const canPrevEpoch = Boolean(currentEpisode && currentEpisodeIndex > 0);
+  const canNextEpoch = Boolean(currentEpisode && currentEpisodeIndex < totalEpochs - 1);
 
   const handlePrevEpoch = useCallback(() => {
     if (currentEpisodeIndex > 0) {
@@ -460,6 +600,7 @@ export default function VisualizerClient() {
         case 'Escape':
           setIsBrowserOpen(false);
           setIsShortcutsOpen(false);
+          setIsManageModalOpen(false);
           break;
         default:
           break;
@@ -496,7 +637,12 @@ export default function VisualizerClient() {
         }}
         onOpenShortcuts={() => setIsShortcutsOpen(true)}
         onOpenEpisodeBrowser={() => setIsBrowserOpen(true)}
+        onOpenSaveSettings={(run) => {
+          setManageModalRun(run);
+          setIsManageModalOpen(true);
+        }}
         uploadedFileName={uploadedFileName}
+        defaultRunId={defaultRunId}
         isUploading={isUploading}
       />
 
@@ -534,114 +680,156 @@ export default function VisualizerClient() {
           </div>
         )}
 
-        {/* Episode Meta Header Strip */}
-        <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 rounded-2xl border border-slate-800/80 bg-slate-900/60 backdrop-blur-sm">
-          <div className="flex items-center gap-3">
-            <h2 className="text-base sm:text-lg font-bold text-white tracking-tight flex items-center gap-2">
-              {isLoadingEpisode && <Loader2 className="w-4 h-4 animate-spin text-sky-400" />}
-              <span>
-                {currentEpisode.name || `Epoch #${currentEpochNumber} (Episode #${currentEpisodeIndex})`}
-              </span>
-            </h2>
+        {!currentEpisode ? (
+          <div className="w-full rounded-2xl border border-slate-800 bg-slate-900/60 backdrop-blur-md p-10 sm:p-16 flex flex-col items-center justify-center text-center gap-6 my-6 shadow-2xl">
+            <div className="h-16 w-16 rounded-2xl bg-sky-950/80 border border-sky-500/30 flex items-center justify-center shadow-lg shadow-sky-950">
+              <Boxes className="w-8 h-8 text-sky-400" />
+            </div>
 
-            {currentEpisode.return !== undefined && (
-              <span
-                className={`px-2.5 py-0.5 rounded-full text-xs font-mono font-bold border ${
-                  currentEpisode.return > 0
-                    ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
-                    : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
-                }`}
+            <div className="max-w-md flex flex-col gap-2">
+              <h2 className="text-xl font-bold text-white tracking-tight">
+                No Trajectory Run Selected
+              </h2>
+              <p className="text-sm text-slate-400 leading-relaxed">
+                {availableRuns.length > 0
+                  ? 'Please select a trajectory run from the dropdown above, or upload a new model diagnostics JSON file.'
+                  : 'frontend/data/runs is currently empty. Upload a training diagnostics or trajectory JSON file to begin inspecting states.'}
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+              <button
+                onClick={() => {
+                  const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+                  input?.click();
+                }}
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm bg-sky-600 hover:bg-sky-500 text-white shadow-lg shadow-sky-900/40 transition-all cursor-pointer"
               >
-                Return: {currentEpisode.return}
-              </span>
-            )}
+                <Upload className="w-4 h-4" />
+                <span>Upload Trajectory JSON</span>
+              </button>
 
-            {currentEpisode.success && (
-              <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                <CheckCircle2 className="w-3.5 h-3.5" /> Success
-              </span>
-            )}
+              <button
+                onClick={() => handleSelectRun('tutorial')}
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-all cursor-pointer"
+              >
+                <span>Try Sample Tutorial Demo</span>
+              </button>
+            </div>
           </div>
+        ) : (
+          <>
+            {/* Episode Meta Header Strip */}
+            <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 rounded-2xl border border-slate-800/80 bg-slate-900/60 backdrop-blur-sm">
+              <div className="flex items-center gap-3">
+                <h2 className="text-base sm:text-lg font-bold text-white tracking-tight flex items-center gap-2">
+                  {isLoadingEpisode && <Loader2 className="w-4 h-4 animate-spin text-sky-400" />}
+                  <span>
+                    {currentEpisode.name || `Epoch #${currentEpochNumber}`}
+                  </span>
+                </h2>
 
-          <div className="flex items-center gap-2 text-xs text-slate-400 font-mono">
-            <span>
-              Total Steps: <strong className="text-white">{totalSteps}</strong>
-            </span>
-            <span className="text-slate-600">•</span>
-            <span>
-              Blocks:{' '}
-              <strong className="text-sky-400">
-                {currentParsed.allBlocks.length}
-              </strong>
-            </span>
-          </div>
-        </div>
+                {currentEpisode.return !== undefined && (
+                  <span
+                    className={`px-2.5 py-0.5 rounded-full text-xs font-mono font-bold border ${
+                      currentEpisode.return > 0
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                        : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                    }`}
+                  >
+                    Return: {currentEpisode.return}
+                  </span>
+                )}
 
-        {/* 3. Visual Canvas & Diagnostics Workspace (Grid layout) */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-          {/* Left Column: Visual Canvas & Step Scrubber (7 cols on large screens) */}
-          <div className="lg:col-span-7 flex flex-col gap-4">
-            <BlocksWorldCanvas
-              layout={currentLayout}
-              hoveredBlock={hoveredBlock}
-              onHoverBlock={setHoveredBlock}
-              columnMode={columnMode}
-              onToggleColumnMode={() =>
-                setColumnMode((m) => (m === 'stable' ? 'compact' : 'stable'))
-              }
-            />
+                {currentEpisode.success && (
+                  <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                    <CheckCircle2 className="w-3.5 h-3.5" /> Success
+                  </span>
+                )}
+              </div>
 
-            <Controls
+              <div className="flex items-center gap-2 text-xs text-slate-400 font-mono">
+                <span>
+                  Total Steps: <strong className="text-white">{totalSteps}</strong>
+                </span>
+                <span className="text-slate-600">•</span>
+                <span>
+                  Blocks:{' '}
+                  <strong className="text-sky-400">
+                    {currentParsed.allBlocks.length}
+                  </strong>
+                </span>
+              </div>
+            </div>
+
+            {/* 3. Visual Canvas & Diagnostics Workspace (Grid layout) */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+              {/* Left Column: Visual Canvas & Step Scrubber (7 cols on large screens) */}
+              <div className="lg:col-span-7 flex flex-col gap-4">
+                <BlocksWorldCanvas
+                  layout={currentLayout}
+                  hoveredBlock={hoveredBlock}
+                  onHoverBlock={setHoveredBlock}
+                  columnMode={columnMode}
+                  onToggleColumnMode={() =>
+                    setColumnMode((m) => (m === 'stable' ? 'compact' : 'stable'))
+                  }
+                />
+
+                <Controls
+                  currentStep={currentStep}
+                  totalSteps={totalSteps}
+                  isPlaying={isPlaying}
+                  playbackSpeed={playbackSpeed}
+                  isLooping={isLooping}
+                  actionName={currentAction.name}
+                  actionType={currentAction.type}
+                  onStepChange={setCurrentStep}
+                  onTogglePlay={handleTogglePlay}
+                  onPrevEpoch={handlePrevEpoch}
+                  onPrevStep={handlePrevStep}
+                  onNextStep={handleNextStep}
+                  onNextEpoch={handleNextEpoch}
+                  canPrevEpoch={canPrevEpoch}
+                  canNextEpoch={canNextEpoch}
+                  currentEpochNumber={currentEpochNumber}
+                  totalEpochs={totalEpochs}
+                  onSpeedChange={setPlaybackSpeed}
+                  onToggleLoop={() => setIsLooping((l) => !l)}
+                  onOpenEpisodeBrowser={() => setIsBrowserOpen(true)}
+                />
+              </div>
+
+              {/* Right Column: Inspector Panel (5 cols on large screens) */}
+              <div className="lg:col-span-5 flex flex-col gap-4">
+                <InspectorPanel
+                  currentStep={currentStep}
+                  totalSteps={totalSteps}
+                  actionName={currentAction.name}
+                  parsedPredicates={currentParsed}
+                  diff={predicateDiff}
+                  hoveredBlock={hoveredBlock}
+                />
+              </div>
+            </div>
+
+            {/* 4. Bottom Trajectory Step Timeline */}
+            <TimelineScrubber
               currentStep={currentStep}
               totalSteps={totalSteps}
-              isPlaying={isPlaying}
-              playbackSpeed={playbackSpeed}
-              isLooping={isLooping}
-              actionName={currentAction.name}
-              actionType={currentAction.type}
-              onStepChange={setCurrentStep}
-              onTogglePlay={handleTogglePlay}
-              onPrevEpoch={handlePrevEpoch}
-              onPrevStep={handlePrevStep}
-              onNextStep={handleNextStep}
-              onNextEpoch={handleNextEpoch}
-              canPrevEpoch={canPrevEpoch}
-              canNextEpoch={canNextEpoch}
-              currentEpochNumber={currentEpochNumber}
-              totalEpochs={totalEpochs}
-              onSpeedChange={setPlaybackSpeed}
-              onToggleLoop={() => setIsLooping((l) => !l)}
-              onOpenEpisodeBrowser={() => setIsBrowserOpen(true)}
+              actions={currentEpisode.actions || []}
+              onSelectStep={setCurrentStep}
             />
-          </div>
-
-          {/* Right Column: Inspector Panel (5 cols on large screens) */}
-          <div className="lg:col-span-5 flex flex-col gap-4">
-            <InspectorPanel
-              currentStep={currentStep}
-              totalSteps={totalSteps}
-              actionName={currentAction.name}
-              parsedPredicates={currentParsed}
-              diff={predicateDiff}
-              hoveredBlock={hoveredBlock}
-            />
-          </div>
-        </div>
-
-        {/* 4. Bottom Trajectory Step Timeline */}
-        <TimelineScrubber
-          currentStep={currentStep}
-          totalSteps={totalSteps}
-          actions={currentEpisode.actions || []}
-          onSelectStep={setCurrentStep}
-        />
+          </>
+        )}
       </main>
 
       {/* 5. Modals */}
       <EpisodeBrowserModal
-        isOpen={isBrowserOpen}
+        isOpen={isBrowserOpen && Boolean(selectedRunId)}
         runId={selectedRunId}
-        currentEpisodeId={currentEpisode.episode_id}
+        currentEpisodeId={currentEpisode ? currentEpisode.episode_id : 0}
+        totalEpisodesInRun={totalEpisodesInRun}
         onClose={() => setIsBrowserOpen(false)}
         onSelectEpisode={(epId) => loadServerEpisode(selectedRunId, epId)}
       />
@@ -649,6 +837,18 @@ export default function VisualizerClient() {
       <KeyboardShortcutsModal
         isOpen={isShortcutsOpen}
         onClose={() => setIsShortcutsOpen(false)}
+      />
+
+      <SaveSettingsModal
+        isOpen={isManageModalOpen}
+        onClose={() => setIsManageModalOpen(false)}
+        run={manageModalRun}
+        allRuns={availableRuns}
+        onSelectRunToManage={(r) => setManageModalRun(r)}
+        onRunRenamed={handleRunRenamed}
+        onRunDeleted={handleRunDeleted}
+        onSetDefault={handleSetDefault}
+        defaultRunId={defaultRunId}
       />
     </div>
   );

@@ -48,18 +48,7 @@ export function getDataRunsDir(): string {
   return candidate3;
 }
 
-/**
- * Fallback training_runs directory (if needed).
- */
-export function getLegacyTrainingRunsDir(): string {
-  const candidate1 = path.resolve(process.cwd(), '../training_runs');
-  if (fs.existsSync(candidate1)) return candidate1;
 
-  const candidate2 = path.resolve(process.cwd(), 'training_runs');
-  if (fs.existsSync(candidate2)) return candidate2;
-
-  return 'C:\\Users\\Ishan\\Personal\\Porfolio\\BlocksWorldSolver\\training_runs';
-}
 
 /**
  * Normalizes different Blocks World trajectory JSON schemas into a unified history format.
@@ -166,13 +155,6 @@ export function resolveRunFilePath(runId: string): string | null {
     if (jsonFile) return path.join(folderPath, jsonFile);
   }
 
-  // Check 4: legacy training_runs folder
-  const legacyDir = getLegacyTrainingRunsDir();
-  const legacyDiag = path.join(legacyDir, runId, 'diagnostics.json');
-  if (fs.existsSync(legacyDiag)) {
-    return legacyDiag;
-  }
-
   return null;
 }
 
@@ -215,23 +197,25 @@ export function loadRunData(runId: string): CachedRun['data'] | null {
 export function getAvailableRuns(): RunSummary[] {
   const dataDir = getDataRunsDir();
   const runs: RunSummary[] = [];
-  const visitedIds = new Set<string>();
+  const defaultRunId = getDefaultRunId();
 
   if (fs.existsSync(dataDir)) {
     const entries = fs.readdirSync(dataDir, { withFileTypes: true });
 
     for (const entry of entries) {
-      if (entry.isFile() && entry.name.endsWith('.json')) {
+      if (entry.isFile() && entry.name.endsWith('.json') && !entry.name.startsWith('.')) {
         const runId = entry.name;
-        const displayName = entry.name.replace(/\.json$/i, '');
-        visitedIds.add(runId);
-        visitedIds.add(displayName);
 
         try {
           const runData = loadRunData(runId);
           const totalEpisodes = runData?.traj_histories?.length || 0;
-          const returns = runData?.returns || [];
 
+          // Strictly require at least 1 valid trajectory episode
+          if (!runData || !runData.traj_histories || totalEpisodes === 0) {
+            continue;
+          }
+
+          const returns = runData.returns || [];
           let avgReturn: number | undefined = undefined;
           let maxReturn: number | undefined = undefined;
 
@@ -243,82 +227,21 @@ export function getAvailableRuns(): RunSummary[] {
 
           runs.push({
             id: runId,
-            name: `${displayName}.json`,
+            name: runId,
             path: `frontend/data/runs/${runId}`,
             totalEpisodes,
             returnsAvailable: returns.length > 0,
             avgReturn,
             maxReturn,
+            isDefault: Boolean(
+              defaultRunId &&
+                (defaultRunId === runId || defaultRunId === runId.replace(/\.json$/i, ''))
+            ),
           });
         } catch {
-          runs.push({
-            id: runId,
-            name: `${displayName}.json`,
-            path: `frontend/data/runs/${runId}`,
-            totalEpisodes: 0,
-            returnsAvailable: false,
-          });
-        }
-      } else if (entry.isDirectory()) {
-        const runId = entry.name;
-        visitedIds.add(runId);
-
-        try {
-          const runData = loadRunData(runId);
-          const totalEpisodes = runData?.traj_histories?.length || 0;
-          const returns = runData?.returns || [];
-
-          let avgReturn: number | undefined = undefined;
-          let maxReturn: number | undefined = undefined;
-
-          if (returns.length > 0) {
-            const sum = returns.reduce((a, b) => a + b, 0);
-            avgReturn = Number((sum / returns.length).toFixed(2));
-            maxReturn = Number(Math.max(...returns).toFixed(2));
-          }
-
-          runs.push({
-            id: runId,
-            name: `Run ${runId}`,
-            path: `frontend/data/runs/${runId}`,
-            totalEpisodes,
-            returnsAvailable: returns.length > 0,
-            avgReturn,
-            maxReturn,
-          });
-        } catch {
-          // ignore
+          // Ignore invalid or unparseable JSON files
         }
       }
-    }
-  }
-
-  // Also check legacy training_runs as fallback if not already visited
-  const legacyDir = getLegacyTrainingRunsDir();
-  if (fs.existsSync(legacyDir)) {
-    try {
-      const entries = fs.readdirSync(legacyDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory() && entry.name.startsWith('train_') && !visitedIds.has(entry.name)) {
-          try {
-            const runData = loadRunData(entry.name);
-            const totalEpisodes = runData?.traj_histories?.length || 0;
-            const returns = runData?.returns || [];
-
-            runs.push({
-              id: entry.name,
-              name: `Run ${entry.name}`,
-              path: `training_runs/${entry.name}`,
-              totalEpisodes,
-              returnsAvailable: returns.length > 0,
-            });
-          } catch {
-            // ignore
-          }
-        }
-      }
-    } catch {
-      // ignore
     }
   }
 
@@ -554,7 +477,7 @@ export function getEpisodeData(runId: string, episodeIndex: number): Episode | n
     episode_id: actualIndex,
     name:
       rawEpisode.name ||
-      `${runId.replace(/\.json$/i, '')} — Epoch #${actualIndex + 1} (Episode #${actualIndex})${
+      `${runId.replace(/\.json$/i, '')} — Epoch #${actualIndex + 1} ${
         ret !== undefined ? ` (Return: ${ret.toFixed(2)})` : ''
       }`,
     total_steps: trajectory.length,
@@ -564,3 +487,154 @@ export function getEpisodeData(runId: string, episodeIndex: number): Episode | n
     success: ret !== undefined ? ret > 2.0 : undefined,
   };
 }
+
+/**
+ * Resolves path to configuration file (frontend/data/config.json).
+ */
+export function getConfigFilePath(): string {
+  const dataDir = path.dirname(getDataRunsDir());
+  return path.join(dataDir, 'config.json');
+}
+
+/**
+ * Gets the configured default run ID, if any.
+ */
+export function getDefaultRunId(): string | null {
+  try {
+    const configPath = getConfigFilePath();
+    if (fs.existsSync(configPath)) {
+      const raw = fs.readFileSync(configPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.defaultRunId === 'string' && parsed.defaultRunId.trim()) {
+        const candidate = resolveRunFilePath(parsed.defaultRunId);
+        if (candidate && fs.existsSync(candidate)) {
+          return parsed.defaultRunId;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * Sets or clears the configured default run ID.
+ */
+export function setDefaultRunId(runId: string | null): void {
+  try {
+    const configPath = getConfigFilePath();
+    const configDir = path.dirname(configPath);
+    if (!fs.existsSync(configDir)) {
+      fs.mkdirSync(configDir, { recursive: true });
+    }
+    let currentConfig: any = {};
+    if (fs.existsSync(configPath)) {
+      try {
+        currentConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      } catch {
+        currentConfig = {};
+      }
+    }
+    currentConfig.defaultRunId = runId ? runId.trim() : null;
+    fs.writeFileSync(configPath, JSON.stringify(currentConfig, null, 2), 'utf8');
+  } catch (err) {
+    console.error('Failed to update config.json:', err);
+  }
+}
+
+/**
+ * Renames a save file in frontend/data/runs/.
+ */
+export function renameRun(
+  oldRunId: string,
+  newDisplayName: string
+): { success: boolean; newRunId: string; message: string } {
+  const dataDir = getDataRunsDir();
+  const oldPath = resolveRunFilePath(oldRunId);
+  if (!oldPath || !fs.existsSync(oldPath)) {
+    throw new Error(`Save "${oldRunId}" not found in data/runs/`);
+  }
+
+  let sanitized = newDisplayName.trim().replace(/[^a-zA-Z0-9._-]/g, '_');
+  if (!sanitized) {
+    throw new Error('New name cannot be empty');
+  }
+  if (!sanitized.toLowerCase().endsWith('.json')) {
+    sanitized += '.json';
+  }
+
+  const newPath = path.join(dataDir, sanitized);
+  if (
+    path.resolve(oldPath).toLowerCase() !== path.resolve(newPath).toLowerCase() &&
+    fs.existsSync(newPath)
+  ) {
+    throw new Error(`A save named "${sanitized}" already exists.`);
+  }
+
+  // Check if this run was default BEFORE renaming on disk
+  const currentDefault = getDefaultRunId();
+  const wasDefault = Boolean(
+    currentDefault &&
+      (currentDefault === oldRunId ||
+        currentDefault === oldRunId.replace(/\.json$/i, '') ||
+        currentDefault === path.basename(oldPath))
+  );
+
+  fs.renameSync(oldPath, newPath);
+
+  // Update default run ID if this run was default
+  if (wasDefault) {
+    setDefaultRunId(sanitized);
+  }
+
+  // Clear cache entries
+  runCache.delete(oldRunId);
+  runCache.delete(oldRunId.replace(/\.json$/i, ''));
+  runCache.delete(path.basename(oldPath));
+  runCache.delete(path.basename(oldPath, '.json'));
+
+  return {
+    success: true,
+    newRunId: sanitized,
+    message: `Renamed to ${sanitized}`,
+  };
+}
+
+/**
+ * Deletes a save file from frontend/data/runs/.
+ */
+export function deleteRun(runId: string): { success: boolean; message: string } {
+  const oldPath = resolveRunFilePath(runId);
+  if (!oldPath || !fs.existsSync(oldPath)) {
+    throw new Error(`Save "${runId}" not found in data/runs/`);
+  }
+
+  // Check if this run was default BEFORE unlinking
+  const currentDefault = getDefaultRunId();
+  const wasDefault = Boolean(
+    currentDefault &&
+      (currentDefault === runId ||
+        currentDefault === runId.replace(/\.json$/i, '') ||
+        currentDefault === path.basename(oldPath))
+  );
+
+  fs.unlinkSync(oldPath);
+
+  // If this run was default, clear default
+  if (wasDefault) {
+    setDefaultRunId(null);
+  }
+
+  // Clear cache entries
+  runCache.delete(runId);
+  runCache.delete(runId.replace(/\.json$/i, ''));
+  runCache.delete(path.basename(oldPath));
+  runCache.delete(path.basename(oldPath, '.json'));
+
+  return {
+    success: true,
+    message: `Deleted ${path.basename(oldPath)}`,
+  };
+}
+

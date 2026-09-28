@@ -8,6 +8,7 @@ interface EpisodeBrowserModalProps {
   isOpen: boolean;
   runId: string;
   currentEpisodeId: number | string;
+  totalEpisodesInRun?: number;
   onClose: () => void;
   onSelectEpisode: (episodeId: number) => void;
 }
@@ -16,6 +17,7 @@ export const EpisodeBrowserModal: React.FC<EpisodeBrowserModalProps> = ({
   isOpen,
   runId,
   currentEpisodeId,
+  totalEpisodesInRun,
   onClose,
   onSelectEpisode,
 }) => {
@@ -66,6 +68,8 @@ export const EpisodeBrowserModal: React.FC<EpisodeBrowserModalProps> = ({
     }
   };
 
+  const maxEpisodes = totalEpisodesInRun || totalEpisodes;
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fadeIn">
       <div className="relative w-full max-w-2xl max-h-[85vh] rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl flex flex-col overflow-hidden">
@@ -77,7 +81,7 @@ export const EpisodeBrowserModal: React.FC<EpisodeBrowserModalProps> = ({
               <span>Browse Epochs / Episodes ({runId})</span>
             </h2>
             <p className="text-xs text-slate-400">
-              Select or jump to any recorded trajectory (1 to {totalEpisodes || 10000})
+              Select or jump to any recorded trajectory{maxEpisodes > 0 ? ` (1 to ${maxEpisodes.toLocaleString()})` : ''}
             </p>
           </div>
           <button
@@ -96,7 +100,7 @@ export const EpisodeBrowserModal: React.FC<EpisodeBrowserModalProps> = ({
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
               <input
                 type="number"
-                placeholder="Jump to Epoch # (1 - 10000)..."
+                placeholder={maxEpisodes > 0 ? `Jump to Epoch # (1 - ${maxEpisodes.toLocaleString()})...` : "Jump to Epoch #..."}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="w-full pl-9 pr-3 py-1.5 rounded-xl bg-slate-800 border border-slate-700 text-xs text-white placeholder-slate-400 focus:outline-none focus:border-sky-500"

@@ -60,6 +60,7 @@ export interface RunSummary {
   avgReturn?: number;
   maxReturn?: number;
   successRate?: number;
+  isDefault?: boolean;
 }
 
 export interface EpisodeListItem {
