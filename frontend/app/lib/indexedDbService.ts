@@ -191,7 +191,7 @@ export async function saveRunToIndexedDB(
         episode_id: idx,
         name:
           rawEpisode.name ||
-          `${runRecord.name.replace(/\.json$/i, '')} — Epoch #${idx + 1} (Episode #${idx})${
+          `${runRecord.name.replace(/\.json$/i, '')} — Epoch #${idx + 1} ${
             ret !== undefined ? ` (Return: ${ret.toFixed(2)})` : ''
           }`,
         total_steps: trajectory.length,
