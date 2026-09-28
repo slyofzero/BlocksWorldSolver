@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { saveUploadedRun } from '@/app/lib/runService';
+import { saveUploadedFileStream } from '@/app/lib/runService';
+import { Readable } from 'stream';
+
+export const dynamic = 'force-dynamic';
 
 export async function POST(request: NextRequest) {
   try {
@@ -10,8 +13,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'No file provided in form data' }, { status: 400 });
     }
 
-    const buffer = Buffer.from(await file.arrayBuffer());
-    const result = saveUploadedRun(file.name, buffer);
+    // Convert Web ReadableStream to Node Readable and stream directly to disk
+    const nodeStream = Readable.fromWeb(file.stream() as any);
+    const result = await saveUploadedFileStream(file.name, nodeStream);
 
     return NextResponse.json(result);
   } catch (err: any) {

@@ -326,6 +326,97 @@ export function getAvailableRuns(): RunSummary[] {
 }
 
 /**
+ * Saves an uploaded JSON file stream into frontend/data/runs/ directory without holding the whole file in memory.
+ */
+export async function saveUploadedFileStream(
+  originalFileName: string,
+  stream: NodeJS.ReadableStream
+): Promise<{ success: boolean; runId: string; totalEpisodes: number; message: string }> {
+  const dataDir = getDataRunsDir();
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+
+  // Clean filename: remove illegal chars, preserve .json
+  let sanitized = originalFileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+  if (!sanitized.toLowerCase().endsWith('.json')) {
+    sanitized += '.json';
+  }
+
+  const targetPath = path.join(dataDir, sanitized);
+  const tempPath = path.join(dataDir, `${sanitized}.tmp-${Date.now()}`);
+
+  // 1. Pipe stream directly to disk (fast streaming, minimal RAM usage)
+  await new Promise<void>((resolve, reject) => {
+    const writeStream = fs.createWriteStream(tempPath);
+    stream.pipe(writeStream);
+    writeStream.on('finish', resolve);
+    writeStream.on('error', reject);
+    stream.on('error', reject);
+  });
+
+  // 2. Validate the saved file
+  try {
+    const text = fs.readFileSync(tempPath, 'utf8');
+    let parsedJson: any;
+    try {
+      parsedJson = JSON.parse(text);
+    } catch (parseErr: any) {
+      throw new Error(`Invalid JSON format: ${parseErr.message}`);
+    }
+
+    const normalized = normalizeRunJson(parsedJson);
+    if (!normalized.traj_histories || normalized.traj_histories.length === 0) {
+      if (Array.isArray(parsedJson?.returns) && parsedJson.returns.length > 0) {
+        throw new Error(
+          'This JSON file contains evaluation returns but is missing "traj_histories". Please ensure the RL evaluation script logged trajectory histories.'
+        );
+      }
+      throw new Error(
+        'JSON does not contain recognized Blocks World trajectory keys (expected "traj_histories", "episodes", or trajectory array).'
+      );
+    }
+
+    // Atomically overwrite targetPath
+    if (fs.existsSync(targetPath)) {
+      try {
+        fs.unlinkSync(targetPath);
+      } catch {
+        // ignore
+      }
+    }
+    fs.renameSync(tempPath, targetPath);
+
+    // Update runCache
+    runCache.set(sanitized, {
+      mtime: fs.statSync(targetPath).mtimeMs,
+      data: normalized,
+    });
+    const withoutExt = sanitized.replace(/\.json$/i, '');
+    runCache.set(withoutExt, {
+      mtime: fs.statSync(targetPath).mtimeMs,
+      data: normalized,
+    });
+
+    return {
+      success: true,
+      runId: sanitized,
+      totalEpisodes: normalized.traj_histories.length,
+      message: `Saved ${sanitized} with ${normalized.traj_histories.length} episodes under frontend/data/runs/`,
+    };
+  } catch (validationErr: any) {
+    if (fs.existsSync(tempPath)) {
+      try {
+        fs.unlinkSync(tempPath);
+      } catch {
+        // ignore
+      }
+    }
+    throw validationErr;
+  }
+}
+
+/**
  * Saves an uploaded JSON file into frontend/data/runs/ directory.
  */
 export function saveUploadedRun(
@@ -356,6 +447,11 @@ export function saveUploadedRun(
 
   const normalized = normalizeRunJson(parsedJson);
   if (!normalized.traj_histories || normalized.traj_histories.length === 0) {
+    if (Array.isArray(parsedJson?.returns) && parsedJson.returns.length > 0) {
+      throw new Error(
+        'This JSON file contains evaluation returns but is missing "traj_histories". Please ensure the RL evaluation script logged trajectory histories.'
+      );
+    }
     throw new Error(
       'JSON does not contain recognized Blocks World trajectory keys (expected "traj_histories", "episodes", or trajectory array).'
     );
@@ -365,9 +461,15 @@ export function saveUploadedRun(
   fs.writeFileSync(targetPath, text, 'utf8');
 
   // Clear cache for this runId
-  runCache.delete(sanitized);
+  runCache.set(sanitized, {
+    mtime: fs.statSync(targetPath).mtimeMs,
+    data: normalized,
+  });
   const withoutExt = sanitized.replace(/\.json$/i, '');
-  runCache.delete(withoutExt);
+  runCache.set(withoutExt, {
+    mtime: fs.statSync(targetPath).mtimeMs,
+    data: normalized,
+  });
 
   return {
     success: true,

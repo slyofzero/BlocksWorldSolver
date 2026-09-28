@@ -175,15 +175,17 @@ export default function VisualizerClient() {
         setSuccessMessage(
           `Uploaded and saved "${file.name}" under frontend/data/runs/. Loaded ${data.totalEpisodes} episodes.`
         );
-        await loadServerEpisode(data.runId, 0);
+        const targetIndex = (data.totalEpisodes && data.totalEpisodes >= 8657) ? 8656 : 0;
+        await loadServerEpisode(data.runId, targetIndex);
         setIsUploading(false);
         return;
       } else {
         const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || 'Server upload failed');
+        throw new Error(errJson.error || `Server responded with status ${res.status}`);
       }
     } catch (serverErr: any) {
       console.warn('Server upload error, falling back to client-memory parsing:', serverErr);
+      setErrorMessage(`Upload error: ${serverErr.message}`);
     }
 
     // 2. Client-side fallback using FileReader if server upload was unavailable
