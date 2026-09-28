@@ -11,6 +11,11 @@ import { KeyboardShortcutsModal } from './KeyboardShortcutsModal';
 import { SaveSettingsModal } from './SaveSettingsModal';
 
 import { Episode, RunSummary } from '../lib/types';
+import {
+  saveRunToIndexedDB,
+  getBrowserRuns,
+  getBrowserEpisode,
+} from '../lib/indexedDbService';
 import { parsePredicates, inferAction } from '../lib/predicateParser';
 import { computeLayout, extractTrajectoryTableBases } from '../lib/layoutEngine';
 import { calculatePredicateDiff } from '../lib/predicateDiff';
@@ -34,7 +39,6 @@ export default function VisualizerClient() {
   // Active Episode State (null when no run selected)
   const [currentEpisode, setCurrentEpisode] = useState<Episode | null>(null);
   const [currentStep, setCurrentStep] = useState<number>(0);
-  const [uploadedEpisodes, setUploadedEpisodes] = useState<Episode[]>([]);
   const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
 
   // Playback State
@@ -52,12 +56,43 @@ export default function VisualizerClient() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
-  // 1. Fetch specific episode from server API
-  const loadServerEpisode = useCallback(async (runId: string, episodeIndex: number) => {
+  // 1. Unified Episode Loader (supports IndexedDB browser storage and server API)
+  const loadEpisode = useCallback(async (runId: string, episodeIndex: number) => {
     setIsLoadingEpisode(true);
     setErrorMessage(null);
     try {
-      const res = await fetch(`/api/runs/${runId}/episode/${episodeIndex}`);
+      if (runId === 'tutorial') {
+        setCurrentEpisode(DEFAULT_TUTORIAL_EPISODES[0]);
+        setCurrentStep(0);
+        setIsPlaying(false);
+        return;
+      }
+
+      // Check if run is stored locally in browser IndexedDB
+      if (runId.startsWith('idb_')) {
+        const ep = await getBrowserEpisode(runId, episodeIndex);
+        if (ep) {
+          setCurrentEpisode(ep);
+          setCurrentStep(0);
+          setIsPlaying(false);
+          return;
+        }
+        // Fallback to episode 0
+        if (episodeIndex !== 0) {
+          const fallback = await getBrowserEpisode(runId, 0);
+          if (fallback) {
+            setCurrentEpisode(fallback);
+            setCurrentStep(0);
+            setIsPlaying(false);
+            return;
+          }
+        }
+        setErrorMessage(`Could not load epoch #${episodeIndex + 1} from browser storage.`);
+        return;
+      }
+
+      // Otherwise query Server API
+      const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/episode/${episodeIndex}`);
       if (res.ok) {
         const data = await res.json();
         if (data.episode) {
@@ -67,9 +102,8 @@ export default function VisualizerClient() {
           return;
         }
       }
-      // If episode index not found (e.g. #7 doesn't exist), try #0
       if (episodeIndex !== 0) {
-        const fallbackRes = await fetch(`/api/runs/${runId}/episode/0`);
+        const fallbackRes = await fetch(`/api/runs/${encodeURIComponent(runId)}/episode/0`);
         if (fallbackRes.ok) {
           const fallbackData = await fallbackRes.json();
           if (fallbackData.episode) {
@@ -80,7 +114,7 @@ export default function VisualizerClient() {
           }
         }
       }
-      setErrorMessage(`Could not load episode ${episodeIndex} from ${runId}.`);
+      setErrorMessage(`Could not load episode ${episodeIndex} from server.`);
     } catch (err: any) {
       console.error('Error fetching episode:', err);
       setErrorMessage(`Error fetching episode: ${err.message}`);
@@ -89,100 +123,127 @@ export default function VisualizerClient() {
     }
   }, []);
 
-  // 2. Fetch available runs on initial mount (remembering user's last choice)
-  useEffect(() => {
-    const fetchRuns = async () => {
+  // Refresh runs helper (combines both browser IndexedDB and server runs)
+  const refreshRuns = useCallback(async () => {
+    try {
+      let serverRuns: RunSummary[] = [];
+      let serverDefault: string | null = null;
       try {
         const res = await fetch('/api/runs');
         if (res.ok) {
           const data = await res.json();
-          const runs: RunSummary[] = data.runs || [];
-          setAvailableRuns(runs);
-
-          // Get defaultRunId from server or localStorage
-          const serverDefault = data.defaultRunId || null;
-          const localDefault =
-            typeof window !== 'undefined'
-              ? localStorage.getItem(DEFAULT_RUN_STORAGE_KEY)
-              : null;
-          const effectiveDefault = serverDefault || localDefault || null;
-          setDefaultRunIdState(effectiveDefault);
-
-          // Restore user's last choice from localStorage if available
-          const savedRunId =
-            typeof window !== 'undefined'
-              ? localStorage.getItem(LAST_RUN_STORAGE_KEY)
-              : null;
-
-          if (savedRunId) {
-            if (savedRunId === 'tutorial') {
-              setSelectedRunId('tutorial');
-              setCurrentEpisode(DEFAULT_TUTORIAL_EPISODES[0]);
-              return;
-            }
-
-            const matchingRun = runs.find((r) => r.id === savedRunId);
-            if (matchingRun) {
-              setSelectedRunId(matchingRun.id);
-              setTotalEpisodesInRun(matchingRun.totalEpisodes);
-              const defaultEpochIndex = matchingRun.totalEpisodes > 0 ? matchingRun.totalEpisodes - 1 : 0;
-              loadServerEpisode(matchingRun.id, defaultEpochIndex);
-              return;
-            } else {
-              // Run no longer exists in data/runs
-              localStorage.removeItem(LAST_RUN_STORAGE_KEY);
-            }
-          }
-
-          // If no previous choice, check if there is an active default save configured
-          if (effectiveDefault) {
-            const defaultMatching = runs.find(
-              (r) => r.id === effectiveDefault || r.id === `${effectiveDefault}.json`
-            );
-            if (defaultMatching) {
-              setSelectedRunId(defaultMatching.id);
-              setTotalEpisodesInRun(defaultMatching.totalEpisodes);
-              const defaultEpochIndex =
-                defaultMatching.totalEpisodes > 0 ? defaultMatching.totalEpisodes - 1 : 0;
-              loadServerEpisode(defaultMatching.id, defaultEpochIndex);
-              return;
-            }
-          }
-
-          // No default JSON selected by default
-          setSelectedRunId('');
-          setCurrentEpisode(null);
-          return;
+          serverRuns = (data.runs || []).map((r: RunSummary) => ({
+            ...r,
+            source: 'server' as const,
+          }));
+          serverDefault = data.defaultRunId || null;
         }
-      } catch (err) {
-        console.error('Failed to query runs API:', err);
+      } catch {
+        // ignore
       }
 
-      setSelectedRunId('');
-      setCurrentEpisode(null);
+      const browserRuns = await getBrowserRuns();
+      const combined = [...browserRuns, ...serverRuns];
+      setAvailableRuns(combined);
+
+      const localDefault =
+        typeof window !== 'undefined'
+          ? localStorage.getItem(DEFAULT_RUN_STORAGE_KEY)
+          : null;
+      const effectiveDefault = localDefault || serverDefault || null;
+      setDefaultRunIdState(effectiveDefault);
+
+      return combined;
+    } catch (err) {
+      console.error('Failed to refresh runs:', err);
+      return [];
+    }
+  }, []);
+
+  // 2. Fetch available runs on initial mount (combining IndexedDB and server runs)
+  useEffect(() => {
+    const fetchRuns = async () => {
+      try {
+        let serverRuns: RunSummary[] = [];
+        let serverDefault: string | null = null;
+        try {
+          const res = await fetch('/api/runs');
+          if (res.ok) {
+            const data = await res.json();
+            serverRuns = (data.runs || []).map((r: RunSummary) => ({
+              ...r,
+              source: 'server' as const,
+            }));
+            serverDefault = data.defaultRunId || null;
+          }
+        } catch {
+          // ignore
+        }
+
+        const browserRuns = await getBrowserRuns();
+        const allRuns = [...browserRuns, ...serverRuns];
+        setAvailableRuns(allRuns);
+
+        const localDefault =
+          typeof window !== 'undefined'
+            ? localStorage.getItem(DEFAULT_RUN_STORAGE_KEY)
+            : null;
+        const effectiveDefault = localDefault || serverDefault || null;
+        setDefaultRunIdState(effectiveDefault);
+
+        // Restore user's last choice from localStorage if available
+        const savedRunId =
+          typeof window !== 'undefined'
+            ? localStorage.getItem(LAST_RUN_STORAGE_KEY)
+            : null;
+
+        if (savedRunId) {
+          if (savedRunId === 'tutorial') {
+            setSelectedRunId('tutorial');
+            setCurrentEpisode(DEFAULT_TUTORIAL_EPISODES[0]);
+            return;
+          }
+
+          const matchingRun = allRuns.find((r) => r.id === savedRunId);
+          if (matchingRun) {
+            setSelectedRunId(matchingRun.id);
+            setTotalEpisodesInRun(matchingRun.totalEpisodes);
+            const defaultEpochIndex =
+              matchingRun.totalEpisodes > 0 ? matchingRun.totalEpisodes - 1 : 0;
+            loadEpisode(matchingRun.id, defaultEpochIndex);
+            return;
+          } else {
+            localStorage.removeItem(LAST_RUN_STORAGE_KEY);
+          }
+        }
+
+        // If no previous choice, check if there is an active default save configured
+        if (effectiveDefault) {
+          const defaultMatching = allRuns.find(
+            (r) => r.id === effectiveDefault || r.id === `${effectiveDefault}.json`
+          );
+          if (defaultMatching) {
+            setSelectedRunId(defaultMatching.id);
+            setTotalEpisodesInRun(defaultMatching.totalEpisodes);
+            const defaultEpochIndex =
+              defaultMatching.totalEpisodes > 0 ? defaultMatching.totalEpisodes - 1 : 0;
+            loadEpisode(defaultMatching.id, defaultEpochIndex);
+            return;
+          }
+        }
+
+        // Otherwise no run selected by default
+        setSelectedRunId('');
+        setCurrentEpisode(null);
+      } catch (err) {
+        console.error('Failed to query runs:', err);
+        setSelectedRunId('');
+        setCurrentEpisode(null);
+      }
     };
 
     fetchRuns();
-  }, [loadServerEpisode]);
-
-  // Refresh runs helper
-  const refreshRuns = useCallback(async () => {
-    try {
-      const res = await fetch('/api/runs');
-      if (res.ok) {
-        const data = await res.json();
-        const runs = data.runs || [];
-        setAvailableRuns(runs);
-        if (data.defaultRunId !== undefined) {
-          setDefaultRunIdState(data.defaultRunId);
-        }
-        return runs as RunSummary[];
-      }
-    } catch (err) {
-      console.error('Failed to refresh runs:', err);
-    }
-    return [];
-  }, []);
+  }, [loadEpisode]);
 
   const handleRunRenamed = async (oldRunId: string, newRunId: string) => {
     const updatedRuns = await refreshRuns();
@@ -198,7 +259,7 @@ export default function VisualizerClient() {
         localStorage.setItem(DEFAULT_RUN_STORAGE_KEY, newRunId);
       }
     }
-    const matching = updatedRuns.find((r) => r.id === newRunId);
+    const matching = updatedRuns.find((r) => r.id === newRunId || r.id === oldRunId);
     if (matching) {
       setManageModalRun(matching);
     }
@@ -261,148 +322,57 @@ export default function VisualizerClient() {
       setCurrentEpisode(DEFAULT_TUTORIAL_EPISODES[0]);
       setCurrentStep(0);
       setIsPlaying(false);
-    } else if (runId === 'custom' && uploadedEpisodes.length > 0) {
-      setCurrentEpisode(uploadedEpisodes[0]);
-      setCurrentStep(0);
-      setIsPlaying(false);
     } else {
       const run = availableRuns.find((r) => r.id === runId);
       if (run) {
         setTotalEpisodesInRun(run.totalEpisodes);
         const targetEpIndex = run.totalEpisodes > 0 ? run.totalEpisodes - 1 : 0;
-        loadServerEpisode(runId, targetEpIndex);
+        loadEpisode(runId, targetEpIndex);
       }
     }
   };
 
-  // 4. Handle Local File Upload (.json) -> Saves to frontend/data/runs/
+  // 4. Handle File Upload (.json) -> Saves directly to browser's IndexedDB
   const handleFileUpload = async (file: File) => {
     setIsUploading(true);
     setErrorMessage(null);
     setSuccessMessage(null);
 
-    // 1. Try uploading to server to store permanently in frontend/data/runs/
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-
-      const res = await fetch('/api/runs/upload', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        // Refresh available runs list from server
-        const runsRes = await fetch('/api/runs');
-        if (runsRes.ok) {
-          const runsData = await runsRes.json();
-          if (runsData.runs) {
-            setAvailableRuns(runsData.runs);
-            const matching = runsData.runs.find((r: any) => r.id === data.runId);
-            if (matching) {
-              setTotalEpisodesInRun(matching.totalEpisodes);
-            }
-          }
-        }
-
-        if (typeof window !== 'undefined') {
-          localStorage.setItem(LAST_RUN_STORAGE_KEY, data.runId);
-        }
-        setSelectedRunId(data.runId);
-        setUploadedFileName(file.name);
-        setSuccessMessage(
-          `Uploaded and saved "${file.name}" under frontend/data/runs/. Loaded ${data.totalEpisodes} episodes.`
-        );
-        const targetIndex = (data.totalEpisodes && data.totalEpisodes > 0) ? data.totalEpisodes - 1 : 0;
-        await loadServerEpisode(data.runId, targetIndex);
-        setIsUploading(false);
-        return;
-      } else {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `Server responded with status ${res.status}`);
-      }
-    } catch (serverErr: any) {
-      console.warn('Server upload error, falling back to client-memory parsing:', serverErr);
-      setErrorMessage(`Upload error: ${serverErr.message}`);
-    }
-
-    // 2. Client-side fallback using FileReader if server upload was unavailable
-    const reader = new FileReader();
-    reader.onload = (e) => {
+      const text = await file.text();
+      let parsedJson: any;
       try {
-        const text = e.target?.result as string;
-        const json = JSON.parse(text);
-
-        let parsedEps: Episode[] = [];
-
-        // Check Format A: { episodes: [ ... ] }
-        if (Array.isArray(json.episodes)) {
-          parsedEps = json.episodes.map((ep: any, idx: number) => ({
-            episode_id: ep.episode_id ?? idx,
-            name: ep.name || `Uploaded Episode #${ep.episode_id ?? idx}`,
-            total_steps: ep.total_steps || ep.trajectory?.length || 0,
-            trajectory: ep.trajectory || [],
-            actions: ep.actions || [],
-            return: ep.return,
-            success: ep.success,
-          }));
-        }
-        // Check Format B: { traj_histories: [ ... ] } (like diagnostics.json)
-        else if (Array.isArray(json.traj_histories)) {
-          parsedEps = json.traj_histories.slice(0, 100).map((th: any, idx: number) => {
-            const traj: string[][] = [th.initial_state || []];
-            const acts: string[] = ['initial_state'];
-            for (const s of th.steps || []) {
-              traj.push(s.predicates || []);
-              acts.push(s.action || 'step');
-            }
-            const ret = json.returns?.[idx];
-            return {
-              episode_id: idx,
-              name: `Uploaded Episode #${idx}${ret !== undefined ? ` (Return: ${ret.toFixed(2)})` : ''}`,
-              total_steps: traj.length,
-              trajectory: traj,
-              actions: acts,
-              return: ret,
-              success: ret !== undefined ? ret > 2.0 : undefined,
-            };
-          });
-        }
-        // Check Format C: raw array of predicates (single episode)
-        else if (Array.isArray(json) && Array.isArray(json[0])) {
-          parsedEps = [
-            {
-              episode_id: 0,
-              name: 'Uploaded Trajectory',
-              total_steps: json.length,
-              trajectory: json,
-              actions: [],
-            },
-          ];
-        }
-
-        if (parsedEps.length > 0) {
-          setUploadedEpisodes(parsedEps);
-          setUploadedFileName(file.name);
-          setSelectedRunId('custom');
-          setCurrentEpisode(parsedEps[parsedEps.length - 1]);
-          setCurrentStep(0);
-          setIsPlaying(false);
-          setSuccessMessage(`Loaded ${file.name} in memory.`);
-        } else {
-          setErrorMessage(
-            'Could not find recognizable trajectory format in JSON file.'
-          );
-        }
-      } catch (err: any) {
-        console.error('File parse error:', err);
-        setErrorMessage(`Invalid JSON file: ${err.message}`);
-      } finally {
-        setIsUploading(false);
+        parsedJson = JSON.parse(text);
+      } catch (parseErr: any) {
+        throw new Error(`Invalid JSON format: ${parseErr.message}`);
       }
-    };
-    reader.readAsText(file);
+
+      // Save directly to browser's IndexedDB (immune to Vercel/server limits)
+      const savedRun = await saveRunToIndexedDB(file.name, parsedJson);
+
+      // Refresh runs list & select the newly saved run
+      await refreshRuns();
+      setSelectedRunId(savedRun.id);
+      setTotalEpisodesInRun(savedRun.totalEpisodes);
+      setUploadedFileName(file.name);
+
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(LAST_RUN_STORAGE_KEY, savedRun.id);
+      }
+
+      setSuccessMessage(
+        `Successfully saved "${file.name}" to browser storage with ${savedRun.totalEpisodes.toLocaleString()} epochs.`
+      );
+
+      // Target the last epoch in history
+      const targetIndex = savedRun.totalEpisodes > 0 ? savedRun.totalEpisodes - 1 : 0;
+      await loadEpisode(savedRun.id, targetIndex);
+    } catch (err: any) {
+      console.error('File upload/storage error:', err);
+      setErrorMessage(`Upload error: ${err.message}`);
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   // 5. Pre-scan table bases for column stability
@@ -497,8 +467,6 @@ export default function VisualizerClient() {
   const totalEpochs =
     selectedRunId === 'tutorial'
       ? 1
-      : uploadedEpisodes.length > 0
-      ? uploadedEpisodes.length
       : totalEpisodesInRun || (currentEpisode ? 1 : 0);
 
   const currentEpochNumber = currentEpisodeIndex + 1;
@@ -508,28 +476,20 @@ export default function VisualizerClient() {
   const handlePrevEpoch = useCallback(() => {
     if (currentEpisodeIndex > 0) {
       const prevIdx = currentEpisodeIndex - 1;
-      if (selectedRunId !== 'tutorial' && selectedRunId !== 'custom') {
-        loadServerEpisode(selectedRunId, prevIdx);
-      } else if (uploadedEpisodes[prevIdx]) {
-        setCurrentEpisode(uploadedEpisodes[prevIdx]);
-        setCurrentStep(0);
-        setIsPlaying(false);
+      if (selectedRunId !== 'tutorial') {
+        loadEpisode(selectedRunId, prevIdx);
       }
     }
-  }, [currentEpisodeIndex, selectedRunId, loadServerEpisode, uploadedEpisodes]);
+  }, [currentEpisodeIndex, selectedRunId, loadEpisode]);
 
   const handleNextEpoch = useCallback(() => {
     if (currentEpisodeIndex < totalEpochs - 1) {
       const nextIdx = currentEpisodeIndex + 1;
-      if (selectedRunId !== 'tutorial' && selectedRunId !== 'custom') {
-        loadServerEpisode(selectedRunId, nextIdx);
-      } else if (uploadedEpisodes[nextIdx]) {
-        setCurrentEpisode(uploadedEpisodes[nextIdx]);
-        setCurrentStep(0);
-        setIsPlaying(false);
+      if (selectedRunId !== 'tutorial') {
+        loadEpisode(selectedRunId, nextIdx);
       }
     }
-  }, [currentEpisodeIndex, totalEpochs, selectedRunId, loadServerEpisode, uploadedEpisodes]);
+  }, [currentEpisodeIndex, totalEpochs, selectedRunId, loadEpisode]);
 
   // 8. Navigation Handlers
   const handleFirstStep = useCallback(() => setCurrentStep(0), []);
@@ -831,7 +791,7 @@ export default function VisualizerClient() {
         currentEpisodeId={currentEpisode ? currentEpisode.episode_id : 0}
         totalEpisodesInRun={totalEpisodesInRun}
         onClose={() => setIsBrowserOpen(false)}
-        onSelectEpisode={(epId) => loadServerEpisode(selectedRunId, epId)}
+        onSelectEpisode={(epId) => loadEpisode(selectedRunId, epId)}
       />
 
       <KeyboardShortcutsModal

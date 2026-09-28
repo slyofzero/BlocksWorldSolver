@@ -169,7 +169,7 @@ export const Header: React.FC<HeaderProps> = ({
               <div className="absolute right-0 sm:left-0 mt-1.5 w-80 sm:w-96 rounded-2xl border border-slate-700 bg-slate-900/95 backdrop-blur-xl shadow-2xl z-50 p-2 text-xs space-y-2 animate-fadeIn">
                 {/* Header */}
                 <div className="px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-slate-400 flex items-center justify-between border-b border-slate-800 pb-1.5">
-                  <span>Saved Runs (frontend/data/runs/)</span>
+                  <span>Saved Trajectories</span>
                   <span className="text-[10px] text-slate-400 font-normal">
                     {availableRuns.length} total
                   </span>
@@ -179,7 +179,7 @@ export const Header: React.FC<HeaderProps> = ({
                 <div className="max-h-64 overflow-y-auto space-y-1 pr-1">
                   {availableRuns.length === 0 ? (
                     <div className="p-3 text-center text-slate-400">
-                      <p>No valid trajectory files in data/runs/.</p>
+                      <p>No saved trajectories yet.</p>
                       <button
                         onClick={() => {
                           setIsDropdownOpen(false);
@@ -197,6 +197,7 @@ export const Header: React.FC<HeaderProps> = ({
                           (defaultRunId === r.id || defaultRunId === r.id.replace(/\.json$/i, ''))
                       );
                       const isItemSelected = r.id === selectedRunId;
+                      const isLocal = r.source === 'indexeddb' || r.id.startsWith('idb_');
 
                       return (
                         <div
@@ -224,6 +225,15 @@ export const Header: React.FC<HeaderProps> = ({
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center gap-1.5">
                                 <span className="font-semibold truncate">{r.name}</span>
+                                <span
+                                  className={`px-1.5 py-0.2 rounded text-[9px] font-medium shrink-0 border ${
+                                    isLocal
+                                      ? 'bg-purple-500/15 text-purple-300 border-purple-500/30'
+                                      : 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                                  }`}
+                                >
+                                  {isLocal ? 'Local' : 'Server'}
+                                </span>
                                 {isItemDefault && (
                                   <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 shrink-0 flex items-center gap-0.5">
                                     <Star className="w-2.5 h-2.5 fill-amber-300" /> Default

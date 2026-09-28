@@ -61,6 +61,7 @@ export interface RunSummary {
   maxReturn?: number;
   successRate?: number;
   isDefault?: boolean;
+  source?: 'server' | 'indexeddb';
 }
 
 export interface EpisodeListItem {

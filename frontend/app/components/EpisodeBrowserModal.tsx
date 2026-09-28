@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, Search, Trophy, ArrowRight, Loader2 } from 'lucide-react';
 import { EpisodeListItem } from '../lib/types';
+import { getBrowserEpisodesPage } from '../lib/indexedDbService';
 
 interface EpisodeBrowserModalProps {
   isOpen: boolean;
@@ -36,13 +37,19 @@ export const EpisodeBrowserModal: React.FC<EpisodeBrowserModalProps> = ({
     const fetchEpisodes = async () => {
       setLoading(true);
       try {
-        const res = await fetch(
-          `/api/runs/${runId}/episodes?page=${page}&limit=40&filter=${filter}`
-        );
-        if (res.ok) {
-          const data = await res.json();
+        if (runId.startsWith('idb_')) {
+          const data = await getBrowserEpisodesPage(runId, { page, limit: 40, filter });
           setEpisodes(data.episodes || []);
           setTotalEpisodes(data.total || 0);
+        } else {
+          const res = await fetch(
+            `/api/runs/${encodeURIComponent(runId)}/episodes?page=${page}&limit=40&filter=${filter}`
+          );
+          if (res.ok) {
+            const data = await res.json();
+            setEpisodes(data.episodes || []);
+            setTotalEpisodes(data.total || 0);
+          }
         }
       } catch (err) {
         console.error('Failed to load episodes:', err);

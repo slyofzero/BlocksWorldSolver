@@ -11,8 +11,10 @@ import {
   AlertTriangle,
   Loader2,
   FolderGit2,
+  HardDrive,
 } from 'lucide-react';
 import { RunSummary } from '../lib/types';
+import { renameBrowserRun, deleteBrowserRun } from '../lib/indexedDbService';
 
 interface SaveSettingsModalProps {
   isOpen: boolean;
@@ -50,8 +52,9 @@ const SaveSettingsModalContent: React.FC<
     defaultRunId &&
       (defaultRunId === run.id || defaultRunId === run.id.replace(/\.json$/i, ''))
   );
+  const isIndexedDB = run.source === 'indexeddb' || run.id.startsWith('idb_');
 
-  // 1. Rename handler
+  // 1. Rename handler (IndexedDB or Server)
   const handleRename = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = newName.trim();
@@ -70,19 +73,25 @@ const SaveSettingsModalContent: React.FC<
     setActionSuccess(null);
 
     try {
-      const res = await fetch(`/api/runs/${encodeURIComponent(run.id)}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ newName: trimmed }),
-      });
+      if (isIndexedDB) {
+        const updatedName = await renameBrowserRun(run.id, trimmed);
+        setActionSuccess(`Successfully renamed to "${updatedName}".`);
+        onRunRenamed(run.id, run.id);
+      } else {
+        const res = await fetch(`/api/runs/${encodeURIComponent(run.id)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ newName: trimmed }),
+        });
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to rename save file.');
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Failed to rename save file.');
+        }
+
+        setActionSuccess(`Successfully renamed to "${data.newRunId}".`);
+        onRunRenamed(run.id, data.newRunId);
       }
-
-      setActionSuccess(`Successfully renamed to "${data.newRunId}".`);
-      onRunRenamed(run.id, data.newRunId);
     } catch (err: any) {
       setActionError(err.message || 'An error occurred while renaming.');
     } finally {
@@ -99,18 +108,15 @@ const SaveSettingsModalContent: React.FC<
     const targetDefault = isDefault ? null : run.id;
 
     try {
-      const res = await fetch('/api/runs/default', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ defaultRunId: targetDefault }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to update default save.');
+      if (!isIndexedDB) {
+        await fetch('/api/runs/default', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ defaultRunId: targetDefault }),
+        }).catch(() => {});
       }
 
-      onSetDefault(data.defaultRunId);
+      onSetDefault(targetDefault);
       setActionSuccess(
         targetDefault
           ? `Set "${run.name}" as the default save.`
@@ -123,20 +129,24 @@ const SaveSettingsModalContent: React.FC<
     }
   };
 
-  // 3. Delete handler
+  // 3. Delete handler (IndexedDB or Server)
   const handleDelete = async () => {
     setIsDeleting(true);
     setActionError(null);
     setActionSuccess(null);
 
     try {
-      const res = await fetch(`/api/runs/${encodeURIComponent(run.id)}`, {
-        method: 'DELETE',
-      });
+      if (isIndexedDB) {
+        await deleteBrowserRun(run.id);
+      } else {
+        const res = await fetch(`/api/runs/${encodeURIComponent(run.id)}`, {
+          method: 'DELETE',
+        });
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to delete save file.');
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Failed to delete save file.');
+        }
       }
 
       onRunDeleted(run.id);
@@ -222,15 +232,24 @@ const SaveSettingsModalContent: React.FC<
           )}
 
           {/* 1. Save Overview Card */}
-          <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-950/40 space-y-2">
+          <div className="p-3.5 rounded-xl border border-slate-800 bg-slate-950/40 space-y-2.5">
             <div className="flex items-center justify-between text-xs">
               <span className="text-slate-400">File Identifier:</span>
-              <span className="font-mono text-white font-semibold">{run.name}</span>
+              <span className="font-mono text-white font-semibold truncate max-w-[240px]">
+                {run.name}
+              </span>
             </div>
             <div className="flex items-center justify-between text-xs">
-              <span className="text-slate-400">Location:</span>
-              <span className="font-mono text-slate-400 truncate max-w-[240px]">
-                frontend/data/runs/{run.name}
+              <span className="text-slate-400">Storage Medium:</span>
+              <span
+                className={`px-2 py-0.5 rounded text-[10px] font-bold flex items-center gap-1 border ${
+                  isIndexedDB
+                    ? 'bg-purple-500/20 text-purple-300 border-purple-500/30'
+                    : 'bg-sky-500/20 text-sky-300 border-sky-500/30'
+                }`}
+              >
+                <HardDrive className="w-3 h-3" />
+                {isIndexedDB ? 'Browser Storage (IndexedDB)' : 'Server Storage (data/runs)'}
               </span>
             </div>
             <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-800/80 text-center">
@@ -297,7 +316,9 @@ const SaveSettingsModalContent: React.FC<
                 <span>Rename Save</span>
               </label>
               <p className="text-xs text-slate-400 mt-0.5">
-                Changes the file name under <code className="text-sky-300 font-mono">frontend/data/runs/</code>
+                {isIndexedDB
+                  ? 'Updates display name in your browser storage'
+                  : 'Changes the file name on server disk'}
               </p>
             </div>
 
@@ -328,7 +349,9 @@ const SaveSettingsModalContent: React.FC<
                 <span>Danger Zone</span>
               </h3>
               <p className="text-xs text-slate-400 mt-0.5">
-                Permanently delete this trajectory file from disk. This cannot be undone.
+                {isIndexedDB
+                  ? 'Permanently delete this trajectory run from browser storage.'
+                  : 'Permanently delete this trajectory file from disk. This cannot be undone.'}
               </p>
             </div>
 
